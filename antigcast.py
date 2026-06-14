@@ -248,6 +248,9 @@ async def _resolve_channel_peer(client):
     ch_id = int(os.environ.get("CHANNEL_OWNER", 0))
     if not ch_id:
         return
+    # Coba pulihkan access_hash dari peer cache MongoDB dulu (lihat
+    # _restore_peer_from_db) — mengurangi PeerIdInvalid pada sesi baru.
+    await _restore_peer_from_db(client, ch_id)
     try:
         ch = await client.get_chat(ch_id)
         title    = ch.title or ""
@@ -266,6 +269,119 @@ async def _resolve_channel_peer(client):
 _STARTUP_MSG_DELETE_AFTER = 10   # detik sebelum pesan startup dihapus
 _STARTUP_MSG_DELAY        = 1.5  # delay antar pengiriman (anti FloodWait)
 
+# ── Peer cache persistence ─────────────────────────────────────────────────────
+# Pyrogram (bot account) hanya bisa resolve send_message/get_chat_member ke
+# sebuah chat jika access_hash chat tersebut sudah ada di cache storage lokal
+# (client.storage). Cache ini biasanya terisi dari UPDATE yang masuk (pesan,
+# member join, dll). Setelah Railway redeploy → container baru → file session
+# baru/dipulihkan TANPA cache peer untuk chat lama → PeerIdInvalid, walau bot
+# masih admin di sana.
+#
+# Solusi: setiap kali ada update masuk dari sebuah chat (RawUpdateHandler di
+# main()), simpan (id, access_hash, type) chat tersebut ke MongoDB collection
+# "peer_cache" (terpisah dari bot_config — agar config penting lain tidak
+# numpuk meski jumlah grup banyak). Saat startup berikutnya, sebelum
+# broadcast, peer yang tersimpan di-inject kembali ke client.storage via
+# update_peers() — efeknya identik dengan "baru menerima pesan dari chat itu",
+# tanpa perlu pesan asli.
+
+
+async def _save_peer_to_db(client, chat_id: int) -> None:
+    """
+    Simpan access_hash chat_id ke MongoDB jika peer sudah dikenal Pyrogram.
+
+    Memakai client.resolve_peer() (API publik, toleran format bot-API
+    -100xxxxxxxxxx) — jika peer sudah ada di cache storage, ini langsung
+    mengembalikan InputPeerChannel/InputPeerChat/InputPeerUser tanpa request
+    ke server. Jika belum dikenal, akan raise — di sini kita abaikan saja
+    (memang belum bisa disimpan).
+    """
+    try:
+        from pyrogram.raw.types import InputPeerChannel, InputPeerChat, InputPeerUser
+        peer = await client.resolve_peer(chat_id)
+        if isinstance(peer, InputPeerChannel):
+            access_hash, peer_type = peer.access_hash, "channel"
+        elif isinstance(peer, InputPeerChat):
+            access_hash, peer_type = 0, "chat"  # basic group, tidak pakai access_hash
+        elif isinstance(peer, InputPeerUser):
+            access_hash, peer_type = peer.access_hash, "user"
+        else:
+            return
+        from database import db as _db
+        await _db["peer_cache"].update_one(
+            {"_id": str(chat_id)},
+            {"$set": {"id": chat_id, "access_hash": access_hash, "type": peer_type}},
+            upsert=True,
+        )
+    except Exception:
+        pass  # belum dikenal / gagal — abaikan diam-diam
+
+
+async def _restore_peer_from_db(client, chat_id: int) -> bool:
+    """
+    Cek apakah chat_id sudah dikenal di cache Pyrogram (resolve_peer berhasil
+    tanpa request server). Jika tidak, coba pulihkan dari MongoDB (disimpan
+    via _save_peer_to_db sebelumnya) dengan storage.update_peers().
+    Return True jika peer sudah/berhasil dikenal secara lokal.
+    """
+    try:
+        await client.resolve_peer(chat_id)
+        return True  # sudah dikenal, tidak perlu restore
+    except Exception:
+        pass
+
+    try:
+        from database import db as _db
+        cached = await _db["peer_cache"].find_one({"_id": str(chat_id)})
+        if not cached or "access_hash" not in cached:
+            return False
+
+        # Konversi id bot-API (-100xxxxxxxxxx / -xxxxxxxxxx) → id "bare" yang
+        # dipakai tabel peers internal storage.
+        raw_id  = chat_id
+        ptype   = str(cached.get("type") or "")
+        if ptype == "channel" and chat_id < 0:
+            raw_id = int(str(chat_id)[4:]) if str(chat_id).startswith("-100") else abs(chat_id)
+        elif chat_id < 0:
+            raw_id = abs(chat_id)
+
+        await client.storage.update_peers(
+            [(raw_id, int(cached["access_hash"]), ptype, None, None)]
+        )
+        # Verifikasi: resolve_peer harus berhasil sekarang
+        await client.resolve_peer(chat_id)
+        return True
+    except Exception as e:
+        print(f"[Startup] ⚠️  Gagal pulihkan peer {chat_id} dari MongoDB: {e}")
+        return False
+
+
+async def _on_any_update(client, update, users, chats) -> None:
+    """
+    RawUpdateHandler global — dipasang di main() setelah app.start().
+    Setiap update yang masuk (pesan, member update, dsb) membawa info chat/user
+    yang membuat Pyrogram mengisi cache peer-nya sendiri. Di sini kita hanya
+    menyalin entri tersebut ke MongoDB agar bisa dipulihkan setelah redeploy.
+    Non-blocking, gagal diam-diam — tidak boleh mengganggu handler lain.
+
+    `chats` berisi raw types.Chat/types.Channel dengan id "bare" (positif).
+    Dikonversi ke format bot-API (-100xxxxxxxxxx untuk channel/supergroup)
+    via pyrogram.utils.get_peer_id agar konsisten dengan chat_id yang
+    dipakai di config_db/seluruh kode bot.
+    """
+    try:
+        if not chats:
+            return
+        from pyrogram import utils as _putils
+        for raw_id, raw_chat in chats.items():
+            try:
+                chat_id = _putils.get_peer_id(raw_chat)
+            except Exception:
+                chat_id = raw_id
+            await _save_peer_to_db(client, chat_id)
+    except Exception:
+        pass
+
 
 async def _send_and_autodelete(client, chat_id: int, text: str) -> bool:
     """
@@ -273,14 +389,11 @@ async def _send_and_autodelete(client, chat_id: int, text: str) -> bool:
     Penghapusan dijalankan sebagai task terpisah agar tidak memblokir broadcast
     ke chat lain. Menangani FloodWait dengan retry sekali.
 
-    Sebelum kirim, peer di-resolve dulu via get_chat_member(chat_id, "me").
-    Pada sesi yang baru dipulihkan dari MongoDB (container baru/redeploy),
-    Pyrogram belum punya access_hash untuk chat lama di cache → get_chat()
-    maupun send_message() langsung gagal PeerIdInvalid. get_chat_member
-    dengan target "me" di-resolve oleh server berdasarkan ID chat + auth bot
-    itu sendiri (tidak butuh access_hash dari cache), dan hasilnya membuat
-    Pyrogram menyimpan peer tersebut ke cache — sehingga send_message
-    sesudahnya berhasil.
+    Sebelum kirim:
+      1. _restore_peer_from_db() — coba pulihkan access_hash dari MongoDB
+         (disimpan dari sesi sebelumnya via _on_any_update).
+      2. get_chat_member(chat_id, "me") — fallback resolve via server jika
+         access_hash belum/tidak ada.
 
     Return True jika pesan berhasil terkirim.
     """
@@ -293,7 +406,10 @@ async def _send_and_autodelete(client, chat_id: int, text: str) -> bool:
         except Exception:
             pass
 
-    # ── Resolve peer dulu (penting setelah session restore di container baru) ──
+    # ── 1. Coba pulihkan peer dari cache MongoDB ─────────────────────────────
+    await _restore_peer_from_db(client, chat_id)
+
+    # ── 2. Resolve via server jika masih belum dikenal ───────────────────────
     try:
         await client.get_chat_member(chat_id, "me")
     except (PeerIdInvalid, ChannelInvalid, ChatIdInvalid) as e:
@@ -305,6 +421,8 @@ async def _send_and_autodelete(client, chat_id: int, text: str) -> bool:
     try:
         msg = await client.send_message(chat_id, text, disable_notification=True)
         asyncio.create_task(_delayed_delete(msg))
+        # Berhasil kirim → simpan/refresh peer cache untuk redeploy berikutnya
+        asyncio.create_task(_save_peer_to_db(client, chat_id))
         return True
     except FloodWait as e:
         wait_s = e.value + 1
@@ -313,6 +431,7 @@ async def _send_and_autodelete(client, chat_id: int, text: str) -> bool:
             await asyncio.sleep(wait_s)
             msg = await client.send_message(chat_id, text, disable_notification=True)
             asyncio.create_task(_delayed_delete(msg))
+            asyncio.create_task(_save_peer_to_db(client, chat_id))
             return True
         except Exception as e2:
             print(f"[Startup] ⚠️  Gagal kirim ke {chat_id} setelah retry: {e2}")
@@ -481,6 +600,16 @@ async def main():
     # Background task delete_worker dijalankan SETELAH app.start() agar client
     # sudah terkoneksi saat worker pertama kali mencoba menghapus pesan.
     asyncio.create_task(delete_worker(app))
+
+    # Pasang RawUpdateHandler global — setiap update masuk dari chat manapun
+    # akan menyalin access_hash peer chat tersebut ke MongoDB (peer cache),
+    # agar saat redeploy berikutnya bot bisa langsung kirim pesan tanpa
+    # PeerIdInvalid (lihat _save_peer_to_db / _restore_peer_from_db).
+    try:
+        from pyrogram.handlers import RawUpdateHandler
+        app.add_handler(RawUpdateHandler(_on_any_update))
+    except Exception as e:
+        print(f"[Startup] ⚠️  Gagal pasang RawUpdateHandler (peer cache): {e}")
 
     try:
         # Simpan session lokal ke MongoDB setelah login berhasil
