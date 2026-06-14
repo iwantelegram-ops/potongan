@@ -272,6 +272,12 @@ async def _send_and_autodelete(client, chat_id: int, text: str) -> bool:
     Kirim pesan ke chat_id, lalu hapus otomatis setelah _STARTUP_MSG_DELETE_AFTER detik.
     Penghapusan dijalankan sebagai task terpisah agar tidak memblokir broadcast
     ke chat lain. Menangani FloodWait dengan retry sekali.
+
+    Sebelum kirim, peer di-resolve dulu via get_chat() — pada sesi yang baru
+    dipulihkan dari MongoDB, Pyrogram belum punya cache peer untuk chat lama
+    sehingga send_message langsung gagal dengan PeerIdInvalid. get_chat()
+    memicu resolve peer dari server Telegram tanpa butuh cache lokal.
+
     Return True jika pesan berhasil terkirim.
     """
     from pyrogram.errors import FloodWait, PeerIdInvalid, ChannelInvalid, ChatIdInvalid, ChatWriteForbidden
@@ -282,6 +288,15 @@ async def _send_and_autodelete(client, chat_id: int, text: str) -> bool:
             await msg.delete()
         except Exception:
             pass
+
+    # ── Resolve peer dulu (penting setelah session restore di container baru) ──
+    try:
+        await client.get_chat(chat_id)
+    except (PeerIdInvalid, ChannelInvalid, ChatIdInvalid) as e:
+        print(f"[Startup] ⚠️  Peer {chat_id} tidak dikenal sesi ini, skip: {e}")
+        return False
+    except Exception:
+        pass  # error lain saat resolve diabaikan, coba kirim langsung
 
     try:
         msg = await client.send_message(chat_id, text, disable_notification=True)
@@ -345,6 +360,18 @@ async def broadcast_startup_message(client) -> None:
 
     if not targets:
         return
+
+    # ── Warm-up sesi sekali di awal ──────────────────────────────────────────
+    # Pada sesi yang baru dipulihkan dari MongoDB (container baru/redeploy),
+    # Pyrogram belum punya cache peer untuk chat lama → get_chat/send_message
+    # bisa gagal PeerIdInvalid. Memuat daftar dialog sekali mengisi cache peer
+    # untuk semua chat yang masih diikuti bot, sehingga get_chat per-target
+    # di bawah lebih mungkin berhasil.
+    try:
+        async for _ in client.get_dialogs(limit=200):
+            pass
+    except Exception as e:
+        print(f"[Startup] ⚠️  Gagal warm-up dialog list: {e}")
 
     print(f"[Startup] 📢 Mengirim pesan startup ke {len(targets)} chat...")
 
